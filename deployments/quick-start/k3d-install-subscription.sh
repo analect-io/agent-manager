@@ -3,15 +3,18 @@
 # of Agent Manager on a local k3d cluster, for WSO2 subscription customers.
 #
 # Attached as its own release asset (like k3d-install.sh) and piped to bash:
-#   curl -fsSL <URL>/k3d-install-subscription.sh | bash -s -- --project <project>
+#   curl -fsSL <URL>/k3d-install-subscription.sh | bash -s -- --project <project> [--version <version>]
 #
 # <project> is your registry project: wso2-agent-manager for a subscription, or
 # wso2-agent-manager-evaluations for an evaluation. The installer itself comes
 # from this release's public bundle on GitHub, as with k3d-install.sh; only the
 # Helm charts and Agent Manager images come from registry.wso2.com/<project>,
-# pulled by helm and by the cluster with your registry credentials. The newest
-# (or the given) update level of the release is found from the chart versions
-# published to the project, so new update levels need no new copy of this script.
+# pulled by helm and by the cluster with your registry credentials.
+#
+# Each copy is tied to the release it shipped with, and installs that release or
+# one of its updates: 1.0.0 is the release itself, and 1.0.0-u<N> its update N
+# (images 1.0.0.<N>). Without --version it installs the newest one published to
+# the project, so new updates need no new copy of this script.
 #
 # Credentials come from AMP_REGISTRY_USERNAME and AMP_REGISTRY_PASSWORD, from a
 # file named by AMP_REGISTRY_CREDENTIALS_FILE holding both, or from a prompt on
@@ -20,7 +23,6 @@
 set -euo pipefail
 
 # Stamped to the release version at build time (see .github/scripts/update-install-helpers.sh).
-# Support updates of a release are published as <release>.<level>.
 DEFAULT_VERSION="1.0.0"
 REGISTRY_HOST="${AMP_SUBSCRIPTION_REGISTRY:-registry.wso2.com}"
 PROJECTS=(wso2-agent-manager wso2-agent-manager-evaluations)
@@ -43,11 +45,11 @@ OpenChoreo and Agent Manager on it, from your WSO2 registry project. Needs Docke
 
   --project        wso2-agent-manager (subscription) or
                    wso2-agent-manager-evaluations (evaluation)
-  --update-level   Update level to install (default: the newest published)
-  --version        Release the update levels belong to (default: the release
-                   this script shipped with)
-  --download-only  Check the credentials, resolve the update level, download
-                   the installer, print where it is, and stop without installing
+  --version        Version to install: the release this script shipped with
+                   (e.g. 1.0.0) or one of its updates (e.g. 1.0.0-u2).
+                   Default: the newest published to the project
+  --download-only  Check the credentials, find the version, download the
+                   installer, print where it is, and stop without installing
 
 Registry credentials: AMP_REGISTRY_USERNAME and AMP_REGISTRY_PASSWORD, or
 AMP_REGISTRY_CREDENTIALS_FILE, or a prompt on the terminal.
@@ -55,24 +57,42 @@ EOF
 }
 
 # --- Arguments ----------------------------------------------------------------
-PROJECT="" LEVEL="" DOWNLOAD_ONLY=false
-VERSION="$DEFAULT_VERSION"
+PROJECT="" REQUESTED="" LEVEL="" DOWNLOAD_ONLY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) PROJECT="${2:?--project requires a value}"; shift 2 ;;
-    --update-level) LEVEL="${2:?--update-level requires a value}"; shift 2 ;;
-    --version) VERSION="${2:?--version requires a value}"; shift 2 ;;
+    --version) REQUESTED="${2:?--version requires a value}"; shift 2 ;;
+    --update-level) die "--update-level was replaced by --version (e.g. --version 1.0.0-u2)" ;;
     --download-only) DOWNLOAD_ONLY=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
+
+# The release this copy installs. AMP_SUBSCRIPTION_RELEASE is for testing an
+# unstamped copy; a customer's copy is already tied to its release.
+VERSION="${AMP_SUBSCRIPTION_RELEASE:-$DEFAULT_VERSION}"
 VERSION="${VERSION#v}"
 # Matched by suffix, not the literal placeholder, which the release stamping rewrites.
 [[ "$VERSION" != *-dev ]] || \
-  die "this copy of the script is not tied to a release — pass --version <release>"
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--version must look like 1.0.0 (got '${VERSION}')"
-[[ -z "$LEVEL" || "$LEVEL" =~ ^(0|[1-9][0-9]*)$ ]] || die "--update-level must be a number (got '${LEVEL}')"
+  die "this copy of the script is not tied to a release — set AMP_SUBSCRIPTION_RELEASE=<release>"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "AMP_SUBSCRIPTION_RELEASE must look like 1.0.0 (got '${VERSION}')"
+
+# --version names the release (level 0) or an update of it (1.0.0-u2). The image
+# form of an update (1.0.0.2) is accepted too, since that is what pods show.
+if [[ -n "$REQUESTED" ]]; then
+  REQUESTED="${REQUESTED#v}"
+  RELEASE_RE="${VERSION//./\\.}"
+  if [[ "$REQUESTED" =~ ^${RELEASE_RE}$ ]]; then
+    LEVEL=0
+  elif [[ "$REQUESTED" =~ ^${RELEASE_RE}(-u|\.)([1-9][0-9]*)$ ]]; then
+    LEVEL="${BASH_REMATCH[2]}"
+  elif [[ "$REQUESTED" =~ ^([0-9]+\.[0-9]+\.[0-9]+)((-u|\.)[1-9][0-9]*)?$ ]]; then
+    die "${REQUESTED} belongs to release ${BASH_REMATCH[1]}, and this installer installs ${VERSION} and its updates. Use https://github.com/${REPO}/releases/download/amp/v${BASH_REMATCH[1]}/k3d-install-subscription.sh"
+  else
+    die "--version must be ${VERSION} or one of its updates, such as ${VERSION}-u1 (got '${REQUESTED}')"
+  fi
+fi
 
 # A piped script has the script itself on stdin, so prompts read the terminal.
 have_tty() { [[ -r /dev/tty ]] && { : </dev/tty; } 2>/dev/null; }
@@ -160,37 +180,71 @@ if ! printf '%s' "$AMP_REGISTRY_PASSWORD" | helm registry login "$REGISTRY_HOST"
   die "${REGISTRY_HOST} rejected the registry credentials: $(tail -1 "$WORK/err")"
 fi
 
-# --- Pick the update ----------------------------------------------------------
-# Update level N of a release is chart version <release>-N, so the newest level
-# is the highest chart version within the release. --devel is what lets helm
-# consider those versions at all, and the range keeps this copy of the script on
-# its own release when a later release's charts are published to the project.
+# --- Pick the version ---------------------------------------------------------
+# The release is chart version <release> and its update N is <release>-uN. To
+# helm, -uN is a prerelease, so every update sorts before the release itself, and
+# "u10" is compared as text, so it sorts before "u9". The newest update is
+# therefore the highest version below the release, counted up from there one
+# level at a time; the publish workflow never skips a level, so the first one
+# missing ends the count. --devel is what lets helm consider prereleases at all.
 CHART_REF="oci://${REGISTRY_HOST}/${PROJECT}/${CHARTS_SUBPATH}/wso2-agent-manager"
-IFS=. read -r major minor patch <<<"$VERSION"
-if [[ -z "$LEVEL" ]]; then
-  constraint=">=${VERSION}-0 <${major}.${minor}.$((patch + 1))-0"
-else
-  constraint="${VERSION}-${LEVEL}"
-fi
-if ! helm show chart "$CHART_REF" --devel --version "$constraint" \
-    ${HELM_REGISTRY_FLAGS[@]+"${HELM_REGISTRY_FLAGS[@]}"} >"$WORK/chart.yaml" 2>"$WORK/err"; then
+
+# Succeeds if a chart matches $1 (a version or a range) and leaves its
+# Chart.yaml in $WORK/chart.yaml; fails if none does; stops on any other error.
+show_chart() {
+  if helm show chart "$CHART_REF" --devel --version "$1" \
+      ${HELM_REGISTRY_FLAGS[@]+"${HELM_REGISTRY_FLAGS[@]}"} >"$WORK/chart.yaml" 2>"$WORK/err"; then
+    return 0
+  fi
   if grep -qiE 'not found|could not locate|no matching|name unknown|not known to registry' "$WORK/err"; then
-    if [[ -n "$LEVEL" ]]; then
-      die "update level ${LEVEL} of ${VERSION} is not published to ${PROJECT}"
-    fi
-    die "no update of ${VERSION} is published to ${PROJECT} yet"
+    return 1
   fi
   if grep -qiE 'unauthori|denied|forbidden|401|403' "$WORK/err"; then
     die "the credentials have no access to ${PROJECT}: check the registry project and the token"
   fi
   die "could not read ${CHART_REF}: $(tail -1 "$WORK/err")"
+}
+
+# Chart version for level $1.
+chart_version_for() {
+  if [[ "$1" -eq 0 ]]; then echo "$VERSION"; else echo "${VERSION}-u$1"; fi
+}
+
+# Prints the newest level published, or nothing if none is.
+newest_level() {
+  local found n
+  if show_chart ">=${VERSION}-u <${VERSION}"; then
+    found="$(sed -n 's/^version:[[:space:]]*//p' "$WORK/chart.yaml" | head -1)"
+    [[ "$found" =~ ^${VERSION//./\\.}-u([1-9][0-9]*)$ ]] || \
+      die "unexpected chart version '${found}' for release ${VERSION} in ${PROJECT}"
+    n="${BASH_REMATCH[1]}"
+    while show_chart "$(chart_version_for $((n + 1)))"; do n=$((n + 1)); done
+    echo "$n"
+  elif show_chart "$VERSION"; then
+    echo 0
+  fi
+}
+
+# A named version is looked up directly. Finding the newest needs the registry
+# to list tags, so for a named version it only adds to the messages and is never
+# allowed to stop the install.
+if [[ -z "$LEVEL" ]]; then
+  LEVEL="$(newest_level)"
+  [[ -n "$LEVEL" ]] || die "nothing of release ${VERSION} is published to ${PROJECT} yet"
+  NEWEST_LEVEL="$LEVEL"
+else
+  if ! show_chart "$(chart_version_for "$LEVEL")"; then
+    NEWEST_LEVEL="$(newest_level 2>/dev/null)" || NEWEST_LEVEL=""
+    die "$(chart_version_for "$LEVEL") is not published to ${PROJECT}${NEWEST_LEVEL:+; the newest is $(chart_version_for "$NEWEST_LEVEL")}"
+  fi
+  NEWEST_LEVEL="$(newest_level 2>/dev/null)" || NEWEST_LEVEL=""
 fi
-CHART_VERSION="$(sed -n 's/^version:[[:space:]]*//p' "$WORK/chart.yaml" | head -1)"
-[[ "$CHART_VERSION" =~ ^${VERSION//./\\.}-([0-9]+)$ ]] || \
-  die "unexpected chart version '${CHART_VERSION}' for release ${VERSION} in ${PROJECT}"
-LEVEL="${BASH_REMATCH[1]}"
-TAG="${VERSION}.${LEVEL}"
-log "Using ${PROJECT} update ${TAG} (charts ${CHART_VERSION})"
+CHART_VERSION="$(chart_version_for "$LEVEL")"
+if [[ "$LEVEL" -eq 0 ]]; then TAG="$VERSION"; else TAG="${VERSION}.${LEVEL}"; fi
+log "Using ${PROJECT} ${CHART_VERSION} (images ${TAG})"
+if [[ -n "$NEWEST_LEVEL" && "$LEVEL" -ne "$NEWEST_LEVEL" ]]; then
+  log "  ${PROJECT} also has a newer version: $(chart_version_for "$NEWEST_LEVEL")"
+fi
 
 # --- Download the installer ---------------------------------------------------
 # The same public release bundle k3d-install.sh uses; it holds no credentials and
@@ -242,6 +296,7 @@ export VERSION="$CHART_VERSION"
 export AMP_REGISTRY_USERNAME AMP_REGISTRY_PASSWORD
 unset AMP_REGISTRY_CREDENTIALS_FILE HELM_REGISTRY_CONFIG
 
-log "Installing Agent Manager ${TAG} on k3d (~15-20 minutes)"
+log "Installing Agent Manager ${CHART_VERSION} on k3d (~15-20 minutes)"
 cd "$QUICK_START_DIR"
 bash ./install.sh
+log "Installed WSO2 Agent Manager ${CHART_VERSION} (images ${TAG}) from ${REGISTRY_HOST}/${PROJECT}"
