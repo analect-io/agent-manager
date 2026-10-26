@@ -155,7 +155,7 @@ func MakeInternalHTTPHandler(params *wiring.AppParams) http.Handler {
 	mux.HandleFunc("GET /internal/gateway/.well-known", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte(`{"gatewayPath":"internal/data/v1"}`)); err != nil {
+		if _, err := w.Write([]byte(`{"gatewayPath":"api/internal/v1"}`)); err != nil {
 			logger.GetLogger(r.Context()).Error("Failed to write gateway well-known response", "error", err)
 		}
 	})
