@@ -181,6 +181,7 @@ func TestAgentAPIKeyService_IssueTestAPIKey_PerUser(t *testing.T) {
 		existing := &models.StoredAPIKey{
 			UUID:    uuid.Must(uuid.NewV7()),
 			Name:    keyName,
+			OUID:    org,
 			Purpose: models.APIKeyPurposeTest,
 		}
 		fx := newAPIKeyServiceFixture(t, existing)
