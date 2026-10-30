@@ -23,9 +23,11 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 	"gorm.io/gorm"
 
+	"github.com/wso2/agent-manager/agent-manager-service/models"
 	"github.com/wso2/agent-manager/agent-manager-service/repositories"
 	"github.com/wso2/agent-manager/agent-manager-service/utils"
 )
@@ -160,14 +162,37 @@ func (s *GatewayInternalAPIService) GetActiveDeploymentByGateway(apiID, ouID, ga
 	return apiYamlMap, nil
 }
 
-// GetActiveLLMProviderDeploymentByGateway retrieves the currently deployed LLM provider artifact
-func (s *GatewayInternalAPIService) GetActiveLLMProviderDeploymentByGateway(ctx context.Context, providerID, ouID, gatewayID string) (map[string]string, error) {
-	provider, err := s.providerRepo.GetByUUID(providerID, ouID)
+// resolveProviderByIDOrHandle looks up an LLM provider by UUID when providerID is a valid
+// UUID, and falls back to a handle lookup otherwise. This matches the call style used by
+// gateway controllers (which send the UUID) and by the management API (which may send a
+// handle). gorm.ErrRecordNotFound from either path is translated to ErrLLMProviderNotFound.
+func (s *GatewayInternalAPIService) resolveProviderByIDOrHandle(providerID, ouID string) (*models.LLMProvider, error) {
+	var (
+		provider *models.LLMProvider
+		err      error
+	)
+	if _, parseErr := uuid.Parse(providerID); parseErr == nil {
+		provider, err = s.providerRepo.GetByUUID(providerID, ouID)
+	} else {
+		provider, err = s.providerRepo.GetByHandle(providerID, ouID)
+	}
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, utils.ErrLLMProviderNotFound
+		}
 		return nil, fmt.Errorf("failed to get LLM provider: %w", err)
 	}
 	if provider == nil {
-		return nil, fmt.Errorf("LLM provider not found")
+		return nil, utils.ErrLLMProviderNotFound
+	}
+	return provider, nil
+}
+
+// GetActiveLLMProviderDeploymentByGateway retrieves the currently deployed LLM provider artifact
+func (s *GatewayInternalAPIService) GetActiveLLMProviderDeploymentByGateway(ctx context.Context, providerID, ouID, gatewayID string) (map[string]string, error) {
+	provider, err := s.resolveProviderByIDOrHandle(providerID, ouID)
+	if err != nil {
+		return nil, err
 	}
 
 	deployment, err := s.deploymentRepo.GetCurrentByGateway(provider.UUID.String(), gatewayID, ouID)
