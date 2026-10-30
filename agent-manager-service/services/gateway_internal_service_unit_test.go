@@ -22,9 +22,11 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+	"gorm.io/gorm"
 
 	"github.com/wso2/agent-manager/agent-manager-service/models"
 	"github.com/wso2/agent-manager/agent-manager-service/repositories/repomocks"
@@ -156,4 +158,74 @@ func TestActiveArtifactDeploymentByGatewayUnparseableYaml(t *testing.T) {
 			assert.NotErrorIs(t, err, tt.notFound)
 		})
 	}
+}
+
+// TestGetActiveLLMProviderDeploymentByGateway_ResolvesProviderByUUIDOrHandle verifies that
+// the gateway-controller caller (which always sends a UUID) and the management-API caller
+// (which may send a handle) both resolve correctly.
+func TestGetActiveLLMProviderDeploymentByGateway_ResolvesProviderByUUIDOrHandle(t *testing.T) {
+	providerUUID := uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	provider := &models.LLMProvider{UUID: providerUUID}
+
+	// resolveSecretsInYAML requires a "spec" key; no secretRef means the YAML
+	// is returned unchanged.
+	const yamlContent = "kind: LLMProvider\nspec:\n  upstream: {}\n"
+	deploymentRepo := &repomocks.DeploymentRepositoryMock{
+		GetCurrentByGatewayFunc: func(string, string, string) (*models.Deployment, error) {
+			return &models.Deployment{Content: []byte(yamlContent)}, nil
+		},
+	}
+
+	t.Run("UUID providerID routes to GetByUUID, not GetByHandle", func(t *testing.T) {
+		var uuidCalled, handleCalled bool
+		providerRepo := &repomocks.LLMProviderRepositoryMock{
+			GetByUUIDFunc: func(id, _ string) (*models.LLMProvider, error) {
+				uuidCalled = true
+				assert.Equal(t, providerUUID.String(), id)
+				return provider, nil
+			},
+			GetByHandleFunc: func(_, _ string) (*models.LLMProvider, error) {
+				handleCalled = true
+				return nil, nil
+			},
+		}
+		svc := NewGatewayInternalAPIService(providerRepo, nil, deploymentRepo, nil, nil, nil)
+		got, err := svc.GetActiveLLMProviderDeploymentByGateway(context.Background(), providerUUID.String(), "ou-1", "gw-1")
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{providerUUID.String(): yamlContent}, got)
+		assert.True(t, uuidCalled, "GetByUUID should have been called")
+		assert.False(t, handleCalled, "GetByHandle must not be called when the ID is a UUID")
+	})
+
+	t.Run("handle providerID routes to GetByHandle, not GetByUUID", func(t *testing.T) {
+		var uuidCalled, handleCalled bool
+		providerRepo := &repomocks.LLMProviderRepositoryMock{
+			GetByUUIDFunc: func(_, _ string) (*models.LLMProvider, error) {
+				uuidCalled = true
+				return nil, nil
+			},
+			GetByHandleFunc: func(handle, _ string) (*models.LLMProvider, error) {
+				handleCalled = true
+				assert.Equal(t, "bedrock-claude", handle)
+				return provider, nil
+			},
+		}
+		svc := NewGatewayInternalAPIService(providerRepo, nil, deploymentRepo, nil, nil, nil)
+		got, err := svc.GetActiveLLMProviderDeploymentByGateway(context.Background(), "bedrock-claude", "ou-1", "gw-1")
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"bedrock-claude": yamlContent}, got)
+		assert.False(t, uuidCalled, "GetByUUID must not be called when the ID is a handle")
+		assert.True(t, handleCalled, "GetByHandle should have been called")
+	})
+
+	t.Run("provider not found returns ErrLLMProviderNotFound", func(t *testing.T) {
+		providerRepo := &repomocks.LLMProviderRepositoryMock{
+			GetByUUIDFunc: func(_, _ string) (*models.LLMProvider, error) {
+				return nil, gorm.ErrRecordNotFound
+			},
+		}
+		svc := NewGatewayInternalAPIService(providerRepo, nil, deploymentRepo, nil, nil, nil)
+		_, err := svc.GetActiveLLMProviderDeploymentByGateway(context.Background(), providerUUID.String(), "ou-1", "gw-1")
+		assert.ErrorIs(t, err, utils.ErrLLMProviderNotFound)
+	})
 }
