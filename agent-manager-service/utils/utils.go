@@ -746,6 +746,25 @@ func validateRepoDetails(repo *spec.RepositoryConfig) error {
 	} else if gitRepoURLRe.MatchString(repo.Url) {
 		// Non-GitHub HTTPS Git host (GitLab, Bitbucket, self-hosted, etc.).
 		// Path may be deep: host/group/subgroup/.../repo — validate every segment.
+		//
+		// Reject cluster-internal hostnames. The regex accepts any name with a TLD
+		// (e.g. *.svc.cluster.local), so we enforce a suffix denylist here as
+		// defence-in-depth against a build pod being redirected to an internal service.
+		host := strings.TrimPrefix(repo.Url, "https://")
+		if slashIdx := strings.Index(host, "/"); slashIdx > 0 {
+			host = host[:slashIdx]
+		}
+		if colonIdx := strings.LastIndex(host, ":"); colonIdx > 0 {
+			host = host[:colonIdx]
+		}
+		for _, suffix := range []string{".svc.cluster.local", ".cluster.local", ".local", ".internal"} {
+			if strings.HasSuffix(host, suffix) {
+				return NewValidationError(
+					"Cluster-internal hostnames are not supported. Use an externally-reachable Git hosting service (e.g. GitHub, GitLab, Bitbucket)",
+					"repository hostname must not be a cluster-internal address",
+				)
+			}
+		}
 		segments := gitURLPathSegments(repo.Url)
 		if len(segments) < 2 {
 			return NewValidationError(
@@ -1319,8 +1338,8 @@ func isValidGitHubIdentifier(value string) bool {
 	if !validPattern.MatchString(value) {
 		return false
 	}
-	// Reject path traversal patterns
-	if strings.Contains(value, "..") {
+	// Reject path traversal patterns and lone dots
+	if strings.Contains(value, "..") || value == "." {
 		return false
 	}
 	return true
@@ -1542,6 +1561,7 @@ var gitRepoURLRe = regexp.MustCompile(
 // HTTPS repository URL, stripping a trailing ".git" suffix and ignoring empty
 // segments caused by leading or trailing slashes.
 // e.g. "https://gitlab.example.com/group/sub/repo.git" → ["group","sub","repo"]
+// Returns nil if the URL has no path component.
 func gitURLPathSegments(rawURL string) []string {
 	// Strip scheme and host
 	rest := rawURL

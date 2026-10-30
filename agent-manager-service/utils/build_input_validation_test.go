@@ -133,6 +133,16 @@ func TestValidateRepoDetails(t *testing.T) {
 		{"localhost rejected", "https://localhost/myorg/myrepo", okBranch, okAppPath, true},
 		{"IP address rejected", "https://192.168.1.1/myorg/myrepo", okBranch, okAppPath, true},
 		{"bare hostname rejected", "https://internal/myorg/myrepo", okBranch, okAppPath, true},
+		// Lone dot in path segment must be rejected (isValidGitHubIdentifier regression).
+		{"lone dot segment rejected", "https://gitlab.example.com/./myrepo", okBranch, okAppPath, true},
+		{"lone dot group segment rejected", "https://gitlab.example.com/myorg/./myrepo", okBranch, okAppPath, true},
+		// Cluster-internal hostnames must be rejected as a defence-in-depth measure.
+		{"svc.cluster.local rejected", "https://openbao.openbao.svc.cluster.local/x/y", okBranch, okAppPath, true},
+		{"cluster.local rejected", "https://myservice.cluster.local/group/repo", okBranch, okAppPath, true},
+		{"dot-local rejected", "https://myserver.local/group/repo", okBranch, okAppPath, true},
+		{"dot-internal rejected", "https://myserver.internal/group/repo", okBranch, okAppPath, true},
+		// nip.io-style DNS-rebinding names are NOT blocked by format validation alone;
+		// egress policy on the build pod is the primary guard for those.
 		{"over-long URL", okURL + strings.Repeat("a", MaxRepositoryURLLength), okBranch, okAppPath, true},
 		{"over-long branch", okURL, strings.Repeat("b", MaxGitBranchLength+1), okAppPath, true},
 	}
