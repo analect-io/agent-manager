@@ -144,6 +144,10 @@ var nonMutatingWritePaths = map[string]bool{
 	// continuously by every open browser tab — auditing it would bury the
 	// trail under telemetry without recording a single thing a user changed.
 	"/telemetry/console-actions": true,
+	// The gateway controller calls this on startup to register its locally-known
+	// artifact configs. amp-api performs only a lookup (UUID → ID), persisting
+	// nothing — the controller stores the returned IDs in its own local state.
+	"/artifacts/import-gateway-artifacts": true,
 }
 
 // sensitiveReadPaths are GET routes that disclose credential material or the
