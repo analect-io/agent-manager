@@ -17,9 +17,12 @@
 package controllers
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -46,6 +49,7 @@ type GatewayInternalController interface {
 	GetDeployments(w http.ResponseWriter, r *http.Request)
 	GetApplications(w http.ResponseWriter, r *http.Request)
 	PushGatewayManifest(w http.ResponseWriter, r *http.Request)
+	ImportGatewayArtifacts(w http.ResponseWriter, r *http.Request)
 }
 
 type gatewayInternalController struct {
@@ -53,6 +57,7 @@ type gatewayInternalController struct {
 	gatewayInternalService *services.GatewayInternalAPIService
 	apiKeyRepo             repositories.APIKeyRepository
 	aiApplicationRepo      repositories.AIApplicationRepository
+	artifactRepo           repositories.ArtifactRepository
 }
 
 // NewGatewayInternalController creates a new gateway internal controller
@@ -61,12 +66,14 @@ func NewGatewayInternalController(
 	gatewayInternalService *services.GatewayInternalAPIService,
 	apiKeyRepo repositories.APIKeyRepository,
 	aiApplicationRepo repositories.AIApplicationRepository,
+	artifactRepo repositories.ArtifactRepository,
 ) GatewayInternalController {
 	return &gatewayInternalController{
 		gatewayService:         gatewayService,
 		gatewayInternalService: gatewayInternalService,
 		apiKeyRepo:             apiKeyRepo,
 		aiApplicationRepo:      aiApplicationRepo,
+		artifactRepo:           artifactRepo,
 	}
 }
 
@@ -522,4 +529,115 @@ func (c *gatewayInternalController) PushGatewayManifest(w http.ResponseWriter, r
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// importArtifactRequest is one entry in the artifacts.json array the gateway
+// controller sends inside the artifacts.zip multipart field.
+type importArtifactRequest struct {
+	DPID          string                 `json:"dpid"`
+	Configuration map[string]interface{} `json:"configuration"`
+	Status        string                 `json:"status"`
+	CreatedAt     time.Time              `json:"createdAt"`
+	UpdatedAt     time.Time              `json:"updatedAt"`
+}
+
+// importArtifactResult is one entry in the response map, keyed by dpid.
+// ID carries the control-plane artifact UUID on success; Error is set on failure.
+type importArtifactResult struct {
+	ID    string `json:"id,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// ImportGatewayArtifacts handles POST /api/internal/v1/artifacts/import-gateway-artifacts
+//
+// The gateway controller (v1.2.0) calls this on startup to push its locally-known artifact
+// configs. The controller's event handler (apikey_processor.go) resolves apikey.updated
+// events by looking up the event's api_id first as a local UUID, then as a cp_artifact_id.
+// Without this endpoint the controller never stores the cp_artifact_id mapping, so any
+// IssueTestAPIKey broadcast for a newly-deployed agent returns "artifact not found".
+//
+// Payload: multipart/form-data
+//   - "artifacts": ZIP file containing "artifacts.json" ([]importArtifactRequest)
+//   - "total":     count of artifacts (informational)
+//
+// Response: map[dpid]importArtifactResult — for each dpid the "id" field echoes the
+// artifact's own UUID back to the controller, which it stores as cp_artifact_id.
+// In this deployment dpid == artifact UUID (the gateway operator stamps the amp-api
+// artifact UUID onto the RestAPI CR's artifact-id annotation, which the controller reads
+// as the dpid), so the mapping is identity but must be explicit for the lookup to work.
+func (c *gatewayInternalController) ImportGatewayArtifacts(w http.ResponseWriter, r *http.Request) {
+	log := logger.GetLogger(r.Context())
+
+	identity, ok := c.authenticateGateway(w, r, "internal-read")
+	if !ok {
+		return
+	}
+
+	// 10 MB is generous for 8 artifacts of a few KB each.
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, "failed to parse multipart form", http.StatusBadRequest)
+		return
+	}
+
+	f, _, err := r.FormFile("artifacts")
+	if err != nil {
+		http.Error(w, "artifacts field missing or unreadable", http.StatusBadRequest)
+		return
+	}
+	defer f.Close()
+
+	zipData, err := io.ReadAll(f)
+	if err != nil {
+		http.Error(w, "failed to read artifacts field", http.StatusBadRequest)
+		return
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		http.Error(w, "artifacts field is not a valid ZIP", http.StatusBadRequest)
+		return
+	}
+
+	var jsonFile *zip.File
+	for _, zf := range zr.File {
+		if zf.Name == "artifacts.json" {
+			jsonFile = zf
+			break
+		}
+	}
+	if jsonFile == nil {
+		http.Error(w, "artifacts.zip does not contain artifacts.json", http.StatusBadRequest)
+		return
+	}
+
+	rc, err := jsonFile.Open()
+	if err != nil {
+		log.Error("Failed to open artifacts.json from ZIP", "error", err)
+		http.Error(w, "failed to open artifacts.json", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
+
+	var requests []importArtifactRequest
+	if err := json.NewDecoder(rc).Decode(&requests); err != nil {
+		http.Error(w, "failed to parse artifacts.json", http.StatusBadRequest)
+		return
+	}
+
+	results := make(map[string]importArtifactResult, len(requests))
+	for _, req := range requests {
+		if req.DPID == "" {
+			continue
+		}
+		artifact, lookupErr := c.artifactRepo.GetByUUID(req.DPID, identity.OUID)
+		if lookupErr != nil || artifact == nil {
+			log.Warn("Artifact not found during gateway import", "dpid", req.DPID, "orgID", identity.OUID)
+			results[req.DPID] = importArtifactResult{Error: fmt.Sprintf("artifact not found: %s", req.DPID)}
+			continue
+		}
+		results[req.DPID] = importArtifactResult{ID: artifact.UUID.String()}
+	}
+
+	log.Info("Gateway artifact import complete", "gatewayID", identity.ID, "total", len(requests), "found", len(results))
+	utils.WriteSuccessResponse(w, http.StatusOK, results)
 }

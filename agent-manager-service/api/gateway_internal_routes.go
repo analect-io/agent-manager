@@ -59,4 +59,10 @@ func RegisterGatewayInternalRoutes(rr *middleware.RouteRegistrar, ctrl controlle
 	// A2A Agent endpoints. The gateway fetches this after an agent.deployed
 	// event and expects a ZIP containing the Agent YAML.
 	rr.HandleFuncWithValidation("GET /agents/{agentId}", ctrl.GetAgent)
+
+	// Artifact import endpoint. The gateway controller calls this on startup to
+	// push its locally-known artifact configs so the control plane can record the
+	// cp_artifact_id mapping the controller's event handler needs to resolve
+	// apikey.updated events.
+	rr.HandleFuncWithValidation("POST /artifacts/import-gateway-artifacts", ctrl.ImportGatewayArtifacts)
 }
